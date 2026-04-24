@@ -1,0 +1,103 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>Spheroid Sizer-updated 250428</title>
+  <!-- D3 for histogram -->
+  <script src="https://d3js.org/d3.v6.min.js"></script>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 20px; }
+    canvas { border: 1px solid #ccc; margin: 10px; }
+    #controls, #filters { margin-bottom: 20px; }
+    #resultsTable { border-collapse: collapse; width: 100%; }
+    #resultsTable th, #resultsTable td { border: 1px solid #ccc; padding: 8px; text-align: center; }
+    th.sortable { cursor: pointer; text-decoration: underline; }
+    label { margin-right: 5px; }
+    input { margin-right: 15px; }
+    /* histogram styling */
+    #histogram { margin-top: 20px; }
+    #sliderControl { margin: 10px 0; }
+  </style>
+</head>
+<body>
+  <h1>Spheroid Sizer-updated 250428</h1>
+  <p>
+    This tool automatically segments the spheroid using a threshold-based method (as a stand-in for active contour segmentation) and extracts key geometric properties. In addition, it offers a manual mode that allows users to draw custom masks—either as freehand brush strokes or closed contours—for direct measurement and comparison with the automated results.
+    <ul>
+      <li>Pixel Volume and Real Volume (mm³)</li>
+      <li>Pixel Area and Real Area (mm²) – computed using a calibration red bar</li>
+      <li>Major Axis Length</li>
+      <li>Minor Axis Length</li>
+      <li>Eccentricity</li>
+    </ul>
+    The calibration uses a red bar known to be 0.5 mm long.
+  </p>
+
+  <div id="controls">
+    <input type="file" id="fileInput" multiple accept="image/*"><br><br>
+
+    <button id="computeBtn" disabled>Compute Auto</button>
+    <button id="pauseBtn" disabled>Pause</button>
+
+    <button id="manualBtn" disabled>Manual Contour</button>
+    <button id="handDrawBtn" disabled>Brush Tool</button>
+    <button id="computeManualBtn" disabled>Compute Manual</button>
+    <button id="clearMaskBtn" disabled>Clear Mask</button>
+    <label for="brushSize">Brush Size:</label>
+    <input type="range" id="brushSize" min="1" max="50" value="5">
+
+    <button id="exportBtn" disabled>Export CSV</button>
+    <span id="progress" style="margin-left:1em;"></span>
+  </div>
+
+  <div id="filters">
+    <label for="filterName">Name:</label>
+    <input type="text" id="filterName" placeholder="File name substring">
+    <label for="minVolume">Min Real Volume (mm³):</label>
+    <input type="number" id="minVolume" step="any" placeholder="Min">
+    <label for="maxVolume">Max Real Volume (mm³):</label>
+    <input type="number" id="maxVolume" step="any" placeholder="Max"><br><br>
+    <label for="minArea">Min Real Area (mm²):</label>
+    <input type="number" id="minArea" step="any" placeholder="Min">
+    <label for="maxArea">Max Real Area (mm²):</label>
+    <input type="number" id="maxArea" step="any" placeholder="Max">
+    <button id="applyFilterBtn">Apply Filter</button>
+    <button id="clearFilterBtn">Clear Filter</button>
+  </div>
+
+  <div style="position: relative; display: inline-block;">
+    <canvas id="originalCanvas" width="400" height="300"></canvas>
+    <canvas id="manualCanvas"
+            width="400" height="300"
+            style="position: absolute; top:0; left:0; pointer-events: none;"></canvas>
+  </div>
+  <canvas id="processedCanvas" width="400" height="300"></canvas>
+
+  <!-- Histogram & interactive slider -->
+  <div id="histogram"></div>
+  <div id="sliderControl">
+    <label for="thresholdSlider">Threshold: <span id="thresholdValue">0</span></label>
+    <input type="range" id="thresholdSlider" min="0" max="255" value="0">
+  </div>
+
+  <h2>Results</h2>
+  <table id="resultsTable">
+    <thead>
+      <tr>
+        <th id="sortFileName" class="sortable">File Name</th>
+        <th>Pixel Volume</th>
+        <th>Real Volume (mm³)</th>
+        <th>Pixel Area</th>
+        <th>Real Area (mm²)</th>
+        <th>Major Axis</th>
+        <th>Minor Axis</th>
+        <th>Eccentricity</th>
+        <th>Valid</th>
+      </tr>
+    </thead>
+    <tbody></tbody>
+  </table>
+
+  <script src="script.js"></script>
+</body>
+</html>
