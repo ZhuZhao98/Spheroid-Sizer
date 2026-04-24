@@ -1,0 +1,614 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>Spheroid Sizer-updated 250428</title>
+  <!-- D3 for histogram -->
+  <script src="https://d3js.org/d3.v6.min.js"></script>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 20px; }
+    canvas { border: 1px solid #ccc; margin: 10px; }
+    #controls, #filters { margin-bottom: 20px; }
+    #resultsTable { border-collapse: collapse; width: 100%; }
+    #resultsTable th, #resultsTable td { border: 1px solid #ccc; padding: 8px; text-align: center; }
+    th.sortable { cursor: pointer; text-decoration: underline; }
+    label { margin-right: 5px; }
+    input { margin-right: 15px; }
+    /* histogram styling */
+    #histogram { margin-top: 20px; }
+    #sliderControl { margin: 10px 0; }
+  </style>
+</head>
+<body>
+  <h1>Spheroid Sizer-updated 250428</h1>
+  <p>
+    This tool automatically segments the spheroid using a threshold-based method (as a stand-in for active contour segmentation) and extracts key geometric properties. In addition, it offers a manual mode that allows users to draw custom masks—either as freehand brush strokes or closed contours—for direct measurement and comparison with the automated results.
+    <ul>
+      <li>Pixel Volume and Real Volume (mm³)</li>
+      <li>Pixel Area and Real Area (mm²) – computed using a calibration red bar</li>
+      <li>Major Axis Length</li>
+      <li>Minor Axis Length</li>
+      <li>Eccentricity</li>
+    </ul>
+    The calibration uses a red bar known to be 0.5 mm long.
+  </p>
+
+  <div id="controls">
+    <input type="file" id="fileInput" multiple accept="image/*"><br><br>
+
+    <button id="computeBtn" disabled>Compute Auto</button>
+    <button id="pauseBtn" disabled>Pause</button>
+
+    <button id="manualBtn" disabled>Manual Contour</button>
+    <button id="handDrawBtn" disabled>Brush Tool</button>
+    <button id="computeManualBtn" disabled>Compute Manual</button>
+    <button id="clearMaskBtn" disabled>Clear Mask</button>
+    <label for="brushSize">Brush Size:</label>
+    <input type="range" id="brushSize" min="1" max="50" value="5">
+
+    <button id="exportBtn" disabled>Export CSV</button>
+    <span id="progress" style="margin-left:1em;"></span>
+  </div>
+
+  <div id="filters">
+    <label for="filterName">Name:</label>
+    <input type="text" id="filterName" placeholder="File name substring">
+    <label for="minVolume">Min Real Volume (mm³):</label>
+    <input type="number" id="minVolume" step="any" placeholder="Min">
+    <label for="maxVolume">Max Real Volume (mm³):</label>
+    <input type="number" id="maxVolume" step="any" placeholder="Max"><br><br>
+    <label for="minArea">Min Real Area (mm²):</label>
+    <input type="number" id="minArea" step="any" placeholder="Min">
+    <label for="maxArea">Max Real Area (mm²):</label>
+    <input type="number" id="maxArea" step="any" placeholder="Max">
+    <button id="applyFilterBtn">Apply Filter</button>
+    <button id="clearFilterBtn">Clear Filter</button>
+  </div>
+
+  <div style="position: relative; display: inline-block;">
+    <canvas id="originalCanvas" width="400" height="300"></canvas>
+    <canvas id="manualCanvas"
+            width="400" height="300"
+            style="position: absolute; top:0; left:0; pointer-events: none;"></canvas>
+  </div>
+  <canvas id="processedCanvas" width="400" height="300"></canvas>
+
+  <!-- Histogram & interactive slider -->
+  <div id="histogram"></div>
+  <div id="sliderControl">
+    <label for="thresholdSlider">Threshold: <span id="thresholdValue">0</span></label>
+    <input type="range" id="thresholdSlider" min="0" max="255" value="0">
+  </div>
+
+  <h2>Results</h2>
+  <table id="resultsTable">
+    <thead>
+      <tr>
+        <th id="sortFileName" class="sortable">File Name</th>
+        <th>Pixel Volume</th>
+        <th>Real Volume (mm³)</th>
+        <th>Pixel Area</th>
+        <th>Real Area (mm²)</th>
+        <th>Major Axis</th>
+        <th>Minor Axis</th>
+        <th>Eccentricity</th>
+        <th>Valid</th>
+      </tr>
+    </thead>
+    <tbody></tbody>
+  </table>
+
+  <script src="script.js"></script>
+</body>
+</html>
+
+// script.js
+document.addEventListener('DOMContentLoaded', () => {
+  // --- UI references ---
+  const fileInput        = document.getElementById('fileInput');
+  const computeBtn       = document.getElementById('computeBtn');
+  const pauseBtn         = document.getElementById('pauseBtn');
+  const manualBtn        = document.getElementById('manualBtn');
+  const handDrawBtn      = document.getElementById('handDrawBtn');
+  const computeManualBtn = document.getElementById('computeManualBtn');
+  const clearMaskBtn     = document.getElementById('clearMaskBtn');
+  const brushSize        = document.getElementById('brushSize');
+  const exportBtn        = document.getElementById('exportBtn');
+  const progressEl       = document.getElementById('progress');
+  const originalCanvas   = document.getElementById('originalCanvas');
+  const manualCanvas     = document.getElementById('manualCanvas');
+  const processedCanvas  = document.getElementById('processedCanvas');
+  const resultsTableBody = document.querySelector('#resultsTable tbody');
+
+  const filterNameInput = document.getElementById('filterName');
+  const minVolumeInput  = document.getElementById('minVolume');
+  const maxVolumeInput  = document.getElementById('maxVolume');
+  const minAreaInput    = document.getElementById('minArea');
+  const maxAreaInput    = document.getElementById('maxArea');
+  const applyFilterBtn  = document.getElementById('applyFilterBtn');
+  const clearFilterBtn  = document.getElementById('clearFilterBtn');
+  const sortFileHeader  = document.getElementById('sortFileName');
+
+  // Histogram & slider
+  const histogramDiv    = d3.select('#histogram');
+  const thresholdSlider = document.getElementById('thresholdSlider');
+  const thresholdValue  = document.getElementById('thresholdValue');
+
+  // --- State ---
+  let images = [], results = [], currentIndex = 0;
+  let processing = false, paused = false;
+  let mmPerPixel = 1;
+  let drawMode = null, isDrawing = false;
+  let contourPoints = [];
+  let histogramSvg, xScale, yScale;
+  let histWidth, histHeight;
+  let currentThreshold = 0;
+  let currentResult = null;
+  let nameAsc = true;
+
+  // 2D contexts (opt into willReadFrequently)
+  const octx = originalCanvas.getContext('2d',  { willReadFrequently: true });
+  const mCtx = manualCanvas.getContext('2d',    { willReadFrequently: true });
+  const pctx = processedCanvas.getContext('2d', { willReadFrequently: true });
+
+  // Helpers
+  function syncCanvasSizes() {
+    manualCanvas.width  = originalCanvas.width;
+    manualCanvas.height = originalCanvas.height;
+    processedCanvas.width  = originalCanvas.width;
+    processedCanvas.height = originalCanvas.height;
+  }
+  syncCanvasSizes();
+
+  // --- D3 histogram setup ---
+  histWidth  = originalCanvas.width;
+  histHeight = 150;
+  const margin = { top:10, right:10, bottom:20, left:30 };
+  xScale = d3.scaleLinear().domain([0,255]).range([0, histWidth]);
+  yScale = d3.scaleLinear().range([histHeight, 0]);
+  histogramSvg = histogramDiv.append('svg')
+    .attr('width',  histWidth + margin.left + margin.right)
+    .attr('height', histHeight + margin.top  + margin.bottom)
+    .append('g')
+      .attr('transform', `translate(${margin.left},${margin.top})`);
+  histogramSvg.append('g')
+    .attr('class','x-axis')
+    .attr('transform', `translate(0,${histHeight})`)
+    .call(d3.axisBottom(xScale).ticks(10));
+  histogramSvg.append('g').attr('class','bars');
+
+  // Slider → redraw processedCanvas
+  thresholdSlider.addEventListener('input', e => {
+    currentThreshold = +e.target.value;
+    thresholdValue.textContent = currentThreshold;
+    if (currentResult) updateProcessed(currentResult);
+  });
+
+  // --- Table rendering & interactivity ---
+  function renderResults(arr) {
+    resultsTableBody.innerHTML = '';
+    arr.forEach(r => {
+      const tr = document.createElement('tr');
+      tr.innerHTML = `
+        <td><a href="#" class="file-link">${r.fileName}</a></td>
+        <td>${r.pixelVolume}</td>
+        <td>${r.realVolume}</td>
+        <td>${r.pixelArea}</td>
+        <td>${r.realArea}</td>
+        <td>${r.majorAxis}</td>
+        <td>${r.minorAxis}</td>
+        <td>${r.eccentricity}</td>
+        <td>${r.valid}</td>
+      `;
+      tr.querySelector('.file-link').addEventListener('click', evt => {
+        evt.preventDefault();
+        showImage(r);
+      });
+      resultsTableBody.appendChild(tr);
+    });
+  }
+  function updateResultsTable() { renderResults(results); }
+
+  // Sort by filename
+  sortFileHeader.addEventListener('click', () => {
+    results.sort((a,b) => nameAsc
+      ? a.fileName.localeCompare(b.fileName, undefined, {numeric:true})
+      : b.fileName.localeCompare(a.fileName, undefined, {numeric:true})
+    );
+    nameAsc = !nameAsc;
+    updateResultsTable();
+  });
+
+  // Filters
+  applyFilterBtn.addEventListener('click', () => {
+    const nf = filterNameInput.value.trim().toLowerCase();
+    const mv = parseFloat(minVolumeInput.value),
+          xv = parseFloat(maxVolumeInput.value),
+          ma = parseFloat(minAreaInput.value),
+          xa = parseFloat(maxAreaInput.value);
+    const filtered = results.filter(r => {
+      if (nf && !r.fileName.toLowerCase().includes(nf)) return false;
+      const rv = parseFloat(r.realVolume), ra = parseFloat(r.realArea);
+      if (!isNaN(mv) && rv < mv) return false;
+      if (!isNaN(xv) && rv > xv) return false;
+      if (!isNaN(ma) && ra < ma) return false;
+      if (!isNaN(xa) && ra > xa) return false;
+      return true;
+    });
+    renderResults(filtered);
+  });
+  clearFilterBtn.addEventListener('click', () => {
+    filterNameInput.value = '';
+    minVolumeInput.value = maxVolumeInput.value =
+    minAreaInput.value   = maxAreaInput.value   = '';
+    updateResultsTable();
+  });
+
+  // --- File loading & auto‐pipeline ---
+  fileInput.addEventListener('change', ev => {
+    images = []; results = []; currentIndex = 0;
+    Array.from(ev.target.files).forEach(f => {
+      const reader = new FileReader();
+      reader.onload = e => images.push({ name:f.name, data:e.target.result });
+      reader.readAsDataURL(f);
+    });
+    computeBtn.disabled = false;
+  });
+
+  computeBtn.addEventListener('click', () => {
+    if (!images.length) return;
+    processing = true; paused = false;
+    computeBtn.disabled       = true;
+    pauseBtn.disabled         = false;
+    manualBtn.disabled        = false;
+    handDrawBtn.disabled      = false;
+    exportBtn.disabled        = false;
+    computeManualBtn.disabled = true;
+    clearMaskBtn.disabled     = true;
+    progressEl.textContent    = 'Processing...';
+    processNextImage();
+  });
+
+  pauseBtn.addEventListener('click', () => {
+    paused = !paused;
+    pauseBtn.textContent = paused ? 'Continue' : 'Pause';
+    if (!paused) processNextImage();
+  });
+
+  function processNextImage() {
+    if (!processing || paused) return;
+    if (currentIndex >= images.length) {
+      processing = false;
+      progressEl.textContent = 'Processing complete.';
+      computeBtn.disabled = false;
+      pauseBtn.disabled   = true;
+      return;
+    }
+    const entry = images[currentIndex];
+    const img = new Image();
+    img.onload = () => {
+      const W = originalCanvas.width, H = originalCanvas.height;
+      // draw original
+      octx.clearRect(0,0,W,H);
+      octx.drawImage(img,0,0,W,H);
+      syncCanvasSizes();
+
+      // calibration
+      mmPerPixel = computeCalibration(octx, W, H);
+
+      // grayscale + Otsu
+      pctx.clearRect(0,0,W,H);
+      pctx.drawImage(img,0,0,W,H);
+      const data = pctx.getImageData(0,0,W,H).data;
+      const gray = new Uint8ClampedArray(W*H);
+      for (let i=0,j=0; i<data.length; i+=4,j++) {
+        gray[j] = 0.299*data[i] + 0.587*data[i+1] + 0.114*data[i+2];
+      }
+      const thr = otsuThreshold(gray);
+
+      // build binary mask & draw
+      const bin = pctx.createImageData(W,H);
+      for (let k=0; k<gray.length; k++) {
+        const c = gray[k] < thr ? 255 : 0;
+        bin.data[4*k]   = c;
+        bin.data[4*k+1] = c;
+        bin.data[4*k+2] = c;
+        bin.data[4*k+3] = 255;
+      }
+      pctx.putImageData(bin, 0, 0);
+
+      // region props
+      const maskArr = new Uint8ClampedArray(gray.length);
+      for (let k=0; k<gray.length; k++) maskArr[k] = gray[k] < thr ? 1 : 0;
+      const rp = computeRegionProps(maskArr, W, H);
+
+      let area, major, minor, ecc, pv, rv, ra, valid;
+      if (rp) {
+        area  = rp.area;
+        major = rp.majorAxisLength;
+        minor = rp.minorAxisLength;
+        ecc   = rp.eccentricity;
+        pv    = 0.5e-9 * minor*minor * major;
+        rv    = pv * Math.pow(mmPerPixel,3);
+        ra    = area * Math.pow(mmPerPixel,2);
+        valid = ecc <= 0.85 ? 'Yes' : 'No';
+      } else {
+        area = major = minor = ecc = pv = rv = ra = 0;
+        valid = 'No';
+      }
+
+      // save for table & interactivity
+      results.push({
+        fileName:     entry.name,
+        pixelVolume:  pv.toExponential(2),
+        realVolume:   rv.toExponential(2),
+        pixelArea:    area.toFixed(2),
+        realArea:     ra.toFixed(4),
+        majorAxis:    major.toFixed(2),
+        minorAxis:    minor.toFixed(2),
+        eccentricity: ecc.toFixed(2),
+        valid,
+        grayArray: Array.from(gray),
+        width: W,
+        height: H,
+        imageSrc: entry.data,
+        threshold: thr
+      });
+      updateResultsTable();
+
+      currentIndex++;
+      progressEl.textContent = `Processed ${currentIndex}/${images.length}`;
+      setTimeout(processNextImage, 150);
+    };
+    img.src = entry.data;
+  }
+
+  // --- Show clicked image + histogram + re‐threshold ---
+  function showImage(r) {
+    currentResult = r;
+    thresholdSlider.value = r.threshold;
+    currentThreshold = r.threshold;
+    thresholdValue.textContent = currentThreshold;
+
+    const img = new Image();
+    img.onload = () => {
+      octx.clearRect(0,0,originalCanvas.width,originalCanvas.height);
+      octx.drawImage(img,0,0,originalCanvas.width,originalCanvas.height);
+      syncCanvasSizes();
+      updateHistogram(r.grayArray);
+      updateProcessed(r);
+    };
+    img.src = r.imageSrc;
+  }
+
+  function updateHistogram(gray) {
+    const hist = new Array(256).fill(0);
+    gray.forEach(v => hist[v]++);
+    yScale.domain([0, d3.max(hist)]);
+    histogramSvg.selectAll('rect').data(hist)
+      .join('rect')
+        .attr('x',   (_,i) => xScale(i))
+        .attr('y',   d    => yScale(d))
+        .attr('width', histWidth/256)
+        .attr('height', d => histHeight - yScale(d));
+  }
+
+  function updateProcessed(r) {
+    const gray = r.grayArray, W = r.width, H = r.height;
+    const bin = pctx.createImageData(W,H);
+    for (let k=0; k<gray.length; k++) {
+      const c = gray[k] < currentThreshold ? 255 : 0;
+      bin.data[4*k]   = c;
+      bin.data[4*k+1] = c;
+      bin.data[4*k+2] = c;
+      bin.data[4*k+3] = 255;
+    }
+    pctx.clearRect(0,0,W,H);
+    pctx.putImageData(bin, 0, 0);
+  }
+
+  // --- Manual / Brush wiring (your previously working code) ---
+  manualBtn.addEventListener('click', () => {
+    drawMode = 'contour';
+    manualCanvas.style.pointerEvents = 'auto';
+    mCtx.clearRect(0,0,manualCanvas.width,manualCanvas.height);
+    contourPoints = [];
+    computeManualBtn.disabled = false;
+    clearMaskBtn.disabled     = false;
+  });
+  handDrawBtn.addEventListener('click', () => {
+    drawMode = 'brush';
+    manualCanvas.style.pointerEvents = 'auto';
+    mCtx.strokeStyle = 'rgba(255,0,0,0.8)';
+    mCtx.lineCap     = 'round';
+    computeManualBtn.disabled = false;
+    clearMaskBtn.disabled     = false;
+  });
+  clearMaskBtn.addEventListener('click', () => {
+    mCtx.clearRect(0,0,manualCanvas.width,manualCanvas.height);
+    contourPoints = [];
+  });
+
+  manualCanvas.addEventListener('mousedown', e => {
+    if (!drawMode) return;
+    isDrawing = true;
+    const rect = manualCanvas.getBoundingClientRect();
+    const x = e.clientX - rect.left, y = e.clientY - rect.top;
+    if (drawMode === 'contour') {
+      contourPoints.push([x,y]);
+      mCtx.fillStyle = 'rgba(255,0,0,0.3)';
+      mCtx.beginPath(); mCtx.arc(x,y,3,0,2*Math.PI); mCtx.fill();
+    } else {
+      mCtx.beginPath();
+      mCtx.lineWidth = +brushSize.value;
+      mCtx.moveTo(x,y);
+    }
+  });
+  manualCanvas.addEventListener('mousemove', e => {
+    if (!isDrawing || drawMode!=='brush') return;
+    const rect = manualCanvas.getBoundingClientRect();
+    const x = e.clientX - rect.left, y = e.clientY - rect.top;
+    mCtx.lineTo(x,y); mCtx.stroke();
+  });
+  manualCanvas.addEventListener('mouseup', () => {
+    isDrawing = false;
+    if (drawMode==='contour' && contourPoints.length>=3) {
+      mCtx.beginPath();
+      mCtx.moveTo(contourPoints[0][0], contourPoints[0][1]);
+      contourPoints.slice(1).forEach(p => mCtx.lineTo(p[0],p[1]));
+      mCtx.closePath(); mCtx.fill();
+    }
+  });
+
+  computeManualBtn.addEventListener('click', () => {
+    // Re-calibrate
+    mmPerPixel = computeCalibration(octx, originalCanvas.width, originalCanvas.height);
+
+    // Build mask from overlay
+    const W = manualCanvas.width, H = manualCanvas.height;
+    const overlay = mCtx.getImageData(0,0,W,H).data;
+    const maskArr  = new Uint8ClampedArray(W*H);
+    for (let i=0,j=0; i<overlay.length; i+=4,j++) {
+      maskArr[j] = overlay[i] > 10 ? 1 : 0;
+    }
+
+    // Draw hand-mask
+    const imgMask = pctx.createImageData(W,H);
+    for (let k=0; k<W*H; k++) {
+      const c = maskArr[k] ? 255 : 0;
+      imgMask.data[4*k]   = c;
+      imgMask.data[4*k+1] = c;
+      imgMask.data[4*k+2] = c;
+      imgMask.data[4*k+3] = 255;
+    }
+    pctx.putImageData(imgMask, 0, 0);
+
+    // Compute props & add to results
+    const rp = computeRegionProps(maskArr, W, H);
+    let area, major, minor, ecc, pv, rv, ra, valid;
+    if (rp) {
+      area  = rp.area;
+      major = rp.majorAxisLength;
+      minor = rp.minorAxisLength;
+      ecc   = rp.eccentricity;
+      pv    = 0.5e-9 * minor*minor * major;
+      rv    = pv * Math.pow(mmPerPixel,3);
+      ra    = area * Math.pow(mmPerPixel,2);
+      valid = ecc <= 0.85 ? 'Yes' : 'No';
+    } else {
+      area = major = minor = ecc = pv = rv = ra = 0;
+      valid = 'No';
+    }
+
+    results.push({
+      fileName:     'Manual',
+      pixelVolume:  pv.toExponential(2),
+      realVolume:   rv.toExponential(2),
+      pixelArea:    area.toFixed(2),
+      realArea:     ra.toFixed(4),
+      majorAxis:    major.toFixed(2),
+      minorAxis:    minor.toFixed(2),
+      eccentricity: ecc.toFixed(2),
+      valid
+    });
+    updateResultsTable();
+  });
+
+  // --- Export CSV ---
+  exportBtn.addEventListener('click', () => {
+    if (!results.length) return alert('No results to export');
+    const header = ['File Name','Pixel Volume','Real Volume (mm³)','Pixel Area','Real Area (mm²)','Major Axis','Minor Axis','Eccentricity','Valid'];
+    const rows   = [header.join(',')];
+    results.forEach(r => rows.push([
+      r.fileName, r.pixelVolume, r.realVolume,
+      r.pixelArea, r.realArea,
+      r.majorAxis, r.minorAxis, r.eccentricity, r.valid
+    ].join(',')));
+    const blob = new Blob([rows.join('\n')], {type:'text/csv'});
+    const url  = URL.createObjectURL(blob);
+    const a    = document.createElement('a');
+    a.href     = url;
+    a.download = 'results.csv';
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  });
+
+  // === Helper functions ===
+
+  // Detect red bar for calibration (0.5 mm)
+  function computeCalibration(ctx, width, height) {
+    const data = ctx.getImageData(0,0,width,height).data;
+    let minX = width, maxX = 0, found = false;
+    for (let y=0; y<height; y++) {
+      for (let x=0; x<width; x++) {
+        const i = 4*(y*width + x), r=data[i], g=data[i+1], b=data[i+2];
+        if (r>200 && g<80 && b<80) {
+          found = true;
+          if (x < minX) minX = x;
+          if (x > maxX) maxX = x;
+        }
+      }
+    }
+    if (!found) return mmPerPixel;
+    const pixelLen = Math.max(1, maxX-minX);
+    return 0.5 / pixelLen;
+  }
+
+  // Otsu's method for threshold
+  function otsuThreshold(gray) {
+    const hist  = new Array(256).fill(0);
+    gray.forEach(v=>hist[v]++);
+    const total = gray.length;
+    let sumAll = 0; for (let i=0;i<256;i++) sumAll += i*hist[i];
+    let sumB=0, wB=0, maxVar=0, thr=0;
+    for (let t=0;t<256;t++) {
+      wB += hist[t];
+      if (wB===0) continue;
+      const wF = total-wB;
+      if (wF===0) break;
+      sumB += t*hist[t];
+      const mB = sumB/wB, mF=(sumAll-sumB)/wF;
+      const varBetween = wB*wF*(mB-mF)**2;
+      if (varBetween>maxVar) { maxVar=varBetween; thr=t; }
+    }
+    return thr;
+  }
+
+  // Region props via second moments → axes + eccentricity
+  function computeRegionProps(mask, width, height) {
+    let area=0, sumX=0, sumY=0;
+    for (let y=0; y<height; y++) {
+      for (let x=0; x<width; x++) {
+        if (mask[y*width + x]) {
+          area++; sumX+=x; sumY+=y;
+        }
+      }
+    }
+    if (area===0) return null;
+    const cx=sumX/area, cy=sumY/area;
+    let mu20=0, mu02=0, mu11=0;
+    for (let y=0; y<height; y++) {
+      for (let x=0; x<width; x++) {
+        if (mask[y*width + x]) {
+          const dx = x-cx, dy = y-cy;
+          mu20 += dx*dx;
+          mu02 += dy*dy;
+          mu11 += dx*dy;
+        }
+      }
+    }
+    mu20/=area; mu02/=area; mu11/=area;
+    const tr   = mu20 + mu02;
+    const det  = mu20*mu02 - mu11*mu11;
+    const term = Math.sqrt(Math.max(0, tr*tr/4 - det));
+    const λ1   = tr/2 + term;
+    const λ2   = tr/2 - term;
+    const majorAxisLength = 4*Math.sqrt(λ1);
+    const minorAxisLength = 4*Math.sqrt(λ2);
+    const eccentricity    = Math.sqrt(1 - λ2/λ1);
+    return { area, majorAxisLength, minorAxisLength, eccentricity };
+  }
+
+}); // end DOMContentLoaded
